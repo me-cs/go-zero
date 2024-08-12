@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	defaultKeyName = "key"
-	delimiter      = '.'
-	ignoreKey      = "-"
+	defaultKeyName   = "key"
+	delimiter        = '.'
+	ignoreKey        = "-"
+	numberTypeString = "number"
 )
 
 var (
@@ -38,7 +39,7 @@ var (
 )
 
 type (
-	// Unmarshaler is used to unmarshal with given tag key.
+	// Unmarshaler is used to unmarshal with the given tag key.
 	Unmarshaler struct {
 		key  string
 		opts unmarshalOptions
@@ -68,7 +69,7 @@ func NewUnmarshaler(key string, opts ...UnmarshalOption) *Unmarshaler {
 	return &unmarshaler
 }
 
-// UnmarshalKey unmarshals m into v with tag key.
+// UnmarshalKey unmarshals m into v with the tag key.
 func UnmarshalKey(m map[string]any, v any) error {
 	return keyUnmarshaler.Unmarshal(m, v)
 }
@@ -112,7 +113,8 @@ func (u *Unmarshaler) unmarshalValuer(m Valuer, v any, fullName string) error {
 	return u.unmarshalWithFullName(simpleValuer{current: m}, v, fullName)
 }
 
-func (u *Unmarshaler) fillMap(fieldType reflect.Type, value reflect.Value, mapValue any, fullName string) error {
+func (u *Unmarshaler) fillMap(fieldType reflect.Type, value reflect.Value,
+	mapValue any, fullName string) error {
 	if !value.CanSet() {
 		return errValueNotSettable
 	}
@@ -153,7 +155,8 @@ func (u *Unmarshaler) fillMapFromString(value reflect.Value, mapValue any) error
 	return nil
 }
 
-func (u *Unmarshaler) fillSlice(fieldType reflect.Type, value reflect.Value, mapValue any, fullName string) error {
+func (u *Unmarshaler) fillSlice(fieldType reflect.Type, value reflect.Value,
+	mapValue any, fullName string) error {
 	if !value.CanSet() {
 		return errValueNotSettable
 	}
@@ -222,11 +225,11 @@ func (u *Unmarshaler) fillSliceFromString(fieldType reflect.Type, value reflect.
 	switch v := mapValue.(type) {
 	case fmt.Stringer:
 		if err := jsonx.UnmarshalFromString(v.String(), &slice); err != nil {
-			return err
+			return fmt.Errorf("fullName: `%s`, error: `%w`", fullName, err)
 		}
 	case string:
 		if err := jsonx.UnmarshalFromString(v, &slice); err != nil {
-			return err
+			return fmt.Errorf("fullName: `%s`, error: `%w`", fullName, err)
 		}
 	default:
 		return errUnsupportedType
@@ -248,6 +251,10 @@ func (u *Unmarshaler) fillSliceFromString(fieldType reflect.Type, value reflect.
 
 func (u *Unmarshaler) fillSliceValue(slice reflect.Value, index int,
 	baseKind reflect.Kind, value any, fullName string) error {
+	if value == nil {
+		return errNilSliceElement
+	}
+
 	ithVal := slice.Index(index)
 	switch v := value.(type) {
 	case fmt.Stringer:
@@ -302,7 +309,34 @@ func (u *Unmarshaler) fillSliceWithDefault(derefedType reflect.Type, value refle
 	return u.fillSlice(derefedType, value, slice, fullName)
 }
 
-func (u *Unmarshaler) generateMap(keyType, elemType reflect.Type, mapValue any, fullName string) (reflect.Value, error) {
+func (u *Unmarshaler) fillUnmarshalerStruct(fieldType reflect.Type,
+	value reflect.Value, targetValue string) error {
+	if !value.CanSet() {
+		return errValueNotSettable
+	}
+
+	baseType := Deref(fieldType)
+	target := reflect.New(baseType)
+	switch u.key {
+	case jsonTagKey:
+		unmarshaler, ok := target.Interface().(json.Unmarshaler)
+		if !ok {
+			return errUnsupportedType
+		}
+
+		if err := unmarshaler.UnmarshalJSON([]byte(targetValue)); err != nil {
+			return err
+		}
+	default:
+		return errUnsupportedType
+	}
+
+	value.Set(target)
+	return nil
+}
+
+func (u *Unmarshaler) generateMap(keyType, elemType reflect.Type, mapValue any,
+	fullName string) (reflect.Value, error) {
 	mapType := reflect.MapOf(keyType, elemType)
 	valueType := reflect.TypeOf(mapValue)
 	if mapType == valueType {
@@ -394,6 +428,15 @@ func (u *Unmarshaler) generateMap(keyType, elemType reflect.Type, mapValue any, 
 	return targetValue, nil
 }
 
+func (u *Unmarshaler) implementsUnmarshaler(t reflect.Type) bool {
+	switch u.key {
+	case jsonTagKey:
+		return t.Implements(reflect.TypeOf((*json.Unmarshaler)(nil)).Elem())
+	default:
+		return false
+	}
+}
+
 func (u *Unmarshaler) parseOptionsWithContext(field reflect.StructField, m Valuer, fullName string) (
 	string, *fieldOptionsWithContext, error) {
 	key, options, err := parseKeyAndOptions(u.key, field)
@@ -421,6 +464,10 @@ func (u *Unmarshaler) parseOptionsWithContext(field reflect.StructField, m Value
 				OptionalDep: u.opts.canonicalKey(options.OptionalDep),
 			}
 		}
+	}
+
+	if u.opts.fillDefault {
+		return key, &options.fieldOptionsWithContext, nil
 	}
 
 	optsWithContext, err := options.toOptionsWithContext(key, m, fullName)
@@ -567,6 +614,8 @@ func (u *Unmarshaler) processFieldNotFromString(fieldType reflect.Type, value re
 		return u.fillSliceFromString(fieldType, value, mapValue, fullName)
 	case valueKind == reflect.String && derefedFieldType == durationType:
 		return fillDurationValue(fieldType, value, mapValue.(string))
+	case valueKind == reflect.String && typeKind == reflect.Struct && u.implementsUnmarshaler(fieldType):
+		return u.fillUnmarshalerStruct(fieldType, value, mapValue.(string))
 	default:
 		return u.processFieldPrimitive(fieldType, value, mapValue, opts, fullName)
 	}
@@ -609,25 +658,28 @@ func (u *Unmarshaler) processFieldPrimitiveWithJSONNumber(fieldType reflect.Type
 	target := reflect.New(Deref(fieldType)).Elem()
 
 	switch typeKind {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		iValue, err := v.Int64()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if err := setValueFromString(typeKind, target, v.String()); err != nil {
+			return err
+		}
+	case reflect.Float32:
+		fValue, err := v.Float64()
 		if err != nil {
 			return err
 		}
 
-		target.SetInt(iValue)
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		iValue, err := v.Int64()
-		if err != nil {
-			return err
+		// if the value is a pointer, we need to check overflow with the pointer's value.
+		derefedValue := value
+		for derefedValue.Type().Kind() == reflect.Ptr {
+			derefedValue = derefedValue.Elem()
+		}
+		if derefedValue.CanFloat() && derefedValue.OverflowFloat(fValue) {
+			return fmt.Errorf("parsing %q as float32: value out of range", v.String())
 		}
 
-		if iValue < 0 {
-			return fmt.Errorf("unmarshal %q with bad value %q", fullName, v.String())
-		}
-
-		target.SetUint(uint64(iValue))
-	case reflect.Float32, reflect.Float64:
+		target.SetFloat(fValue)
+	case reflect.Float64:
 		fValue, err := v.Float64()
 		if err != nil {
 			return err
@@ -635,7 +687,7 @@ func (u *Unmarshaler) processFieldPrimitiveWithJSONNumber(fieldType reflect.Type
 
 		target.SetFloat(fValue)
 	default:
-		return newTypeMismatchErrorWithHint(fullName, typeKind.String(), value.Type().String())
+		return newTypeMismatchErrorWithHint(fullName, typeKind.String(), numberTypeString)
 	}
 
 	SetValue(fieldType, value, target)

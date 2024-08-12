@@ -2,10 +2,13 @@ package parser
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
+	"github.com/zeromicro/go-zero/core/lang"
 	"github.com/zeromicro/go-zero/tools/goctl/api/spec"
 	"github.com/zeromicro/go-zero/tools/goctl/pkg/parser/api/ast"
+	"github.com/zeromicro/go-zero/tools/goctl/pkg/parser/api/importstack"
 	"github.com/zeromicro/go-zero/tools/goctl/pkg/parser/api/placeholder"
 	"github.com/zeromicro/go-zero/tools/goctl/pkg/parser/api/token"
 )
@@ -18,13 +21,14 @@ type Analyzer struct {
 
 func (a *Analyzer) astTypeToSpec(in ast.DataType) (spec.Type, error) {
 	isLiteralType := func(dt ast.DataType) bool {
-		_, ok := dt.(*ast.BaseDataType)
-		if ok {
+		if _, ok := dt.(*ast.BaseDataType); ok {
 			return true
 		}
-		_, ok = dt.(*ast.AnyDataType)
+
+		_, ok := dt.(*ast.AnyDataType)
 		return ok
 	}
+
 	switch v := (in).(type) {
 	case *ast.BaseDataType:
 		raw := v.RawText()
@@ -33,27 +37,48 @@ func (a *Analyzer) astTypeToSpec(in ast.DataType) (spec.Type, error) {
 				RawName: raw,
 			}, nil
 		}
+
 		return spec.DefineStruct{RawName: raw}, nil
 	case *ast.AnyDataType:
 		return nil, ast.SyntaxError(v.Pos(), "unsupported any type")
 	case *ast.StructDataType:
-		// TODO(keson) feature: can be extended
+		var members []spec.Member
+		for _, item := range v.Elements {
+			m, err := a.fieldToMember(item)
+			if err != nil {
+				return nil, err
+			}
+			members = append(members, m)
+		}
+		if v.RawText() == "{}" {
+			return nil, ast.SyntaxError(v.Pos(), "unsupported empty struct")
+		}
+
+		return spec.NestedStruct{
+			RawName: v.RawText(),
+			Members: members,
+		}, nil
 	case *ast.InterfaceDataType:
 		return spec.InterfaceType{RawName: v.RawText()}, nil
 	case *ast.MapDataType:
 		if !isLiteralType(v.Key) {
-			return nil, ast.SyntaxError(v.Pos(), "expected literal type, got <%T>", v)
+			return nil, ast.SyntaxError(v.Pos(), "expected literal type, got <%T>", v.Key)
 		}
 		if !v.Key.CanEqual() {
-			return nil, ast.SyntaxError(v.Pos(), "map key <%T> must be equal data type", v)
+			return nil, ast.SyntaxError(v.Pos(), "map key <%T> must be equal data type", v.Key)
 		}
+		if v.Value.ContainsStruct() {
+			return nil, ast.SyntaxError(v.Pos(), "map value unsupported nested struct")
+		}
+
 		value, err := a.astTypeToSpec(v.Value)
 		if err != nil {
 			return nil, err
 		}
+
 		return spec.MapType{
 			RawName: v.RawText(),
-			Key:     v.RawText(),
+			Key:     v.Key.RawText(),
 			Value:   value,
 		}, nil
 	case *ast.PointerDataType:
@@ -66,27 +91,37 @@ func (a *Analyzer) astTypeToSpec(in ast.DataType) (spec.Type, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		return spec.PointerType{
 			RawName: v.RawText(),
 			Type:    value,
 		}, nil
 	case *ast.ArrayDataType:
 		if v.Length.Token.Type == token.ELLIPSIS {
-			return nil, ast.SyntaxError(v.Pos(), "Array: unsupported dynamic length")
+			return nil, ast.SyntaxError(v.Pos(), "array length unsupported dynamic length")
+		}
+		if v.ContainsStruct() {
+			return nil, ast.SyntaxError(v.Pos(), "array elements unsupported nested struct")
 		}
 		value, err := a.astTypeToSpec(v.DataType)
 		if err != nil {
 			return nil, err
 		}
+
 		return spec.ArrayType{
 			RawName: v.RawText(),
 			Value:   value,
 		}, nil
 	case *ast.SliceDataType:
+		if v.ContainsStruct() {
+			return nil, ast.SyntaxError(v.Pos(), "slice elements unsupported nested struct")
+		}
+
 		value, err := a.astTypeToSpec(v.DataType)
 		if err != nil {
 			return nil, err
 		}
+
 		return spec.ArrayType{
 			RawName: v.RawText(),
 			Value:   value,
@@ -97,11 +132,33 @@ func (a *Analyzer) astTypeToSpec(in ast.DataType) (spec.Type, error) {
 }
 
 func (a *Analyzer) convert2Spec() error {
+	a.fillInfo()
+
 	if err := a.fillTypes(); err != nil {
 		return err
 	}
 
-	return a.fillService()
+	if err := a.fillService(); err != nil {
+		return err
+	}
+
+	sort.SliceStable(a.spec.Types, func(i, j int) bool {
+		return a.spec.Types[i].Name() < a.spec.Types[j].Name()
+	})
+
+	groups := make([]spec.Group, 0, len(a.spec.Service.Groups))
+	for _, v := range a.spec.Service.Groups {
+		sort.SliceStable(v.Routes, func(i, j int) bool {
+			return v.Routes[i].Path < v.Routes[j].Path
+		})
+		groups = append(groups, v)
+	}
+	sort.SliceStable(groups, func(i, j int) bool {
+		return groups[i].Annotation.Properties[groupKeyText] < groups[j].Annotation.Properties[groupKeyText]
+	})
+	a.spec.Service.Groups = groups
+
+	return nil
 }
 
 func (a *Analyzer) convertAtDoc(atDoc ast.AtDocStmt) spec.AtDoc {
@@ -119,8 +176,13 @@ func (a *Analyzer) convertKV(kv []*ast.KVExpr) map[string]string {
 	var ret = map[string]string{}
 	for _, v := range kv {
 		key := strings.TrimSuffix(v.Key.Token.Text, ":")
-		ret[key] = v.Value.Token.Text
+		if key == summaryKeyText {
+			ret[key] = v.Value.RawText()
+		} else {
+			ret[key] = v.Value.Token.Text
+		}
 	}
+
 	return ret
 }
 
@@ -146,6 +208,7 @@ func (a *Analyzer) fieldToMember(field *ast.ElemExpr) (spec.Member, error) {
 	if field.Tag != nil {
 		m.Tag = field.Tag.Token.Text
 	}
+
 	return m, nil
 }
 
@@ -205,14 +268,14 @@ func (a *Analyzer) fillService() error {
 			}
 
 			if astRoute.Route.Request != nil && astRoute.Route.Request.Body != nil {
-				requestType, err := a.getType(astRoute.Route.Request)
+				requestType, err := a.getType(astRoute.Route.Request, true)
 				if err != nil {
 					return err
 				}
 				route.RequestType = requestType
 			}
 			if astRoute.Route.Response != nil && astRoute.Route.Response.Body != nil {
-				responseType, err := a.getType(astRoute.Route.Response)
+				responseType, err := a.getType(astRoute.Route.Response, false)
 				if err != nil {
 					return err
 				}
@@ -238,12 +301,32 @@ func (a *Analyzer) fillService() error {
 	return nil
 }
 
+func (a *Analyzer) fillInfo() {
+	properties := make(map[string]string)
+	if a.api.info != nil {
+		for _, kv := range a.api.info.Values {
+			key := kv.Key.Token.Text
+			properties[strings.TrimSuffix(key, ":")] = kv.Value.RawText()
+		}
+	}
+	a.spec.Info.Properties = properties
+	infoKeyValue := make(map[string]string)
+	for key, value := range properties {
+		titleKey := strings.Title(strings.TrimSuffix(key, ":"))
+		infoKeyValue[titleKey] = value
+	}
+	a.spec.Info.Title = infoKeyValue[infoTitleKey]
+	a.spec.Info.Desc = infoKeyValue[infoDescKey]
+	a.spec.Info.Version = infoKeyValue[infoVersionKey]
+	a.spec.Info.Author = infoKeyValue[infoAuthorKey]
+	a.spec.Info.Email = infoKeyValue[infoEmailKey]
+}
+
 func (a *Analyzer) fillTypes() error {
 	for _, item := range a.api.TypeStmt {
 		switch v := (item).(type) {
 		case *ast.TypeLiteralStmt:
-			err := a.fillTypeExpr(v.Expr)
-			if err != nil {
+			if err := a.fillTypeExpr(v.Expr); err != nil {
 				return err
 			}
 		case *ast.TypeGroupStmt:
@@ -319,8 +402,12 @@ func (a *Analyzer) findDefinedType(name string) (spec.Type, error) {
 	return nil, fmt.Errorf("type %s not defined", name)
 }
 
-func (a *Analyzer) getType(expr *ast.BodyStmt) (spec.Type, error) {
+func (a *Analyzer) getType(expr *ast.BodyStmt, req bool) (spec.Type, error) {
 	body := expr.Body
+	if req && body.IsArrayType() {
+		return nil, ast.SyntaxError(body.Pos(), "request body must be struct")
+	}
+
 	var tp spec.Type
 	var err error
 	var rawText = body.Format("")
@@ -361,10 +448,18 @@ func Parse(filename string, src interface{}) (*spec.ApiSpec, error) {
 		return nil, err
 	}
 
-	var importManager = make(map[string]placeholder.Type)
-	importManager[ast.Filename] = placeholder.PlaceHolder
-	api, err := convert2API(ast, importManager)
+	is := importstack.New()
+	err := is.Push(ast.Filename)
 	if err != nil {
+		return nil, err
+	}
+
+	importSet := map[string]lang.PlaceholderType{}
+	api, err := convert2API(ast, importSet, is)
+	if err != nil {
+		return nil, err
+	}
+	if err := api.SelfCheck(); err != nil {
 		return nil, err
 	}
 
